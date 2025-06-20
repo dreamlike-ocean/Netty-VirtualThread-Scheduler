@@ -10,6 +10,22 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 
+/**
+ * 这里简要概括一下
+ * 这里的目的是使用“IoEventLoop线程”运行VirtualThread，如果EventLoop为平台线程那么在平台线程vt和这个平台线程会触及同一个Lock/blockQueue的时候有概率发生死锁问题
+ * 所以这里希望将EventLoop运行在vt上，而平台线程从EventLoop中剥离，不会直接接受任何运行的普通Runnable，只会运行虚拟线程的Runnable
+ * 所以这里的实现思路是：
+ * 1, 创建一个ioEventLoop虚拟线程，这个线程会运行ioHandler，同时获取这个vt中的continuation（runnable形式的），
+ *    在对应的平台线程的run方法中运行这个continuation，同时他会根据当前负载/IO读取情况通过Thread::yield主动让出执行权，同时再此投递到平台线程中，等待下次调用
+ * 2, 利用当前载体创建n个虚拟线程，即VirtualThreadNettyScheduler::toVTExecutor
+ *
+ * 原有的EventLoop上的定时任务时间源仍由IoHandle处理，即你看到的VirtualThreadNettyScheduler::runIOHandler中的blockingRunIoEventLoop调用
+ * 对于jdk的selector其阻塞会让当前VT让出并不会阻塞当前载体线程，但是native的selector则不会
+ * 为了使得Selector的jdk实现和native效果一致，你在代码里面还能看到park carrierThread的代码
+ *
+ * 调用顺序应该是
+ * driverVirtualThreadAndIOEventLoop -> runIOHandler -> runExternalContinuations
+ */
 public class VirtualThreadNettyScheduler implements Executor {
 
    private static final long MAX_WAIT_TASKS_NS = TimeUnit.HOURS.toNanos(1);
@@ -43,7 +59,7 @@ public class VirtualThreadNettyScheduler implements Executor {
       // we can start the carrier only after all the fields are initialized
       eventLoopContinuationAvailable = new CountDownLatch(1);
       carrierThread.start();
-      // 确保第一个任务一定是runIOHandler的任务
+      // 确保第一个任务一定是runIOHandler的任务 只有拿到IO的continuation的时候才能提供外部运行
       try {
          eventLoopContinuationAvailable.await();
       } catch (InterruptedException e) {
@@ -199,9 +215,10 @@ public class VirtualThreadNettyScheduler implements Executor {
    }
 
    private Runnable setEventLoopContinuation(Runnable command) {
-      // this is the first command, we need to set the continuation
+      // 拿到eventLoopContinuation 方便手操是否继续IO操作
       this.eventLoopContinuation = command;
       // we need to notify the event loop that we have a continuation
+      // 可以对外提供服务了
       eventLoopContinuationAvailable.countDown();
       return command;
    }

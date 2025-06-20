@@ -1,27 +1,19 @@
 package io.netty.loom;
 
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executor;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.locks.LockSupport;
-
 import io.netty.channel.IoEventLoopGroup;
 import io.netty.channel.IoHandlerFactory;
 import io.netty.channel.ManualIoEventLoop;
 import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.internal.shaded.org.jctools.queues.MpscUnboundedArrayQueue;
 
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
+
 public class VirtualThreadNettyScheduler implements Executor {
 
    private static final long MAX_WAIT_TASKS_NS = TimeUnit.HOURS.toNanos(1);
-   // These are the soft-guaranteed yield times for the event loop whilst Thread.yield() is called.
-   // Based on the status of the event loop (resuming from blocking or non-blocking, controlled by the running flag)
-   // a different limit is applied.
-   private static final long RUNNING_YIELD_US = TimeUnit.MICROSECONDS.toNanos(Integer.getInteger("io.netty.loom.running.yield.us", 1));
-   private static final long IDLE_YIELD_US = TimeUnit.MICROSECONDS.toNanos(Integer.getInteger("io.netty.loom.idle.yield.us", 1));
+   private static final long MAX_RUN_NS = TimeUnit.MICROSECONDS.toNanos(Integer.getInteger("io.netty.loom.run.us", 1));
 
    private final MpscUnboundedArrayQueue<Runnable> externalContinuations;
    private final ManualIoEventLoop ioEventLoop;
@@ -37,19 +29,21 @@ public class VirtualThreadNettyScheduler implements Executor {
    public VirtualThreadNettyScheduler(IoEventLoopGroup parent, ThreadFactory threadFactory, IoHandlerFactory ioHandlerFactory, int resumedContinuationsExpectedCount) {
       this.running = new AtomicBoolean(false);
       this.externalContinuations = new MpscUnboundedArrayQueue<>(resumedContinuationsExpectedCount);
-      this.carrierThread = threadFactory.newThread(this::virtualThreadSchedulerLoop);
+      this.carrierThread = threadFactory.newThread(this::driverVirtualThreadAndIOEventLoop);
       var builder = LoomSupport.setVirtualThreadFactoryScheduler(Thread.ofVirtual(), this);
-      this.vThreadFactory = builder.factory();
+      this.vThreadFactory = builder
+              .name(carrierThread.getName() + "-VirtualThreadWorker-", 0)
+              .factory();
       this.eventLoopThread = builder.unstarted(
-            // this is enabling the adaptive allocator to use unshared magazines
-            () -> FastThreadLocalThread.runWithFastThreadLocal(this::nettyEventLoop));
+              // 为了诸如adaptive Allocator之类FastThreadLocalThread优化
+              () -> FastThreadLocalThread.runWithFastThreadLocal(this::runIOHandler));
+      this.eventLoopThread.setName(carrierThread.getName() + "-IOHandleVirtualThread");
       this.ioEventLoop = new ManualIoEventLoop(parent, eventLoopThread,
-            ioExecutor -> new AwakeAwareIoHandler(running, ioHandlerFactory.newHandler(ioExecutor)));
+              ioExecutor -> new AwakeAwareIoHandler(running, ioHandlerFactory.newHandler(ioExecutor)));
       // we can start the carrier only after all the fields are initialized
       eventLoopContinuationAvailable = new CountDownLatch(1);
       carrierThread.start();
-      // TODO we cannot make the virtual thread factory available until the event loop v thread is started:
-      //      we can save this if we can query the virtual thread associated with a continuation
+      // 确保第一个任务一定是runIOHandler的任务
       try {
          eventLoopContinuationAvailable.await();
       } catch (InterruptedException e) {
@@ -69,19 +63,24 @@ public class VirtualThreadNettyScheduler implements Executor {
       return ioEventLoop;
    }
 
-   private void nettyEventLoop() {
+   private void runIOHandler() {
+      // 在单线程vt上跑的ioHandler
       running.set(true);
       assert ioEventLoop.inEventLoop(Thread.currentThread()) && Thread.currentThread().isVirtual();
       boolean canBlock = false;
       while (!ioEventLoop.isShuttingDown()) {
          if (canBlock) {
-            canBlock = blockingRunIO();
+            // 如果是io_uring之类会让CarrierThread阻塞在这里 这也是eventloop的定时器时间来源
+            // 如果在pin的时候需要运行vt/任务则需要唤醒ManualIoEventLoop
+            canBlock = blockingRunIoEventLoop();
          } else {
-            canBlock = ioEventLoop.runNow(RUNNING_YIELD_US) == 0;
+            canBlock = ioEventLoop.runNow(MAX_RUN_NS) == 0;
          }
+         // 让出vt的carrierThread执行权限 请上一步中产生的vt或者任务可以执行
+         // vt yield本质是重新调用executor::execute放在队尾
          Thread.yield();
          // try running leftover write tasks before checking for I/O tasks
-         canBlock &= ioEventLoop.runNonBlockingTasks(RUNNING_YIELD_US) == 0;
+         canBlock &= ioEventLoop.runNonBlockingTasks(MAX_RUN_NS) == 0;
          Thread.yield();
       }
       // we are shutting down, it shouldn't take long so let's spin a bit :P
@@ -90,7 +89,7 @@ public class VirtualThreadNettyScheduler implements Executor {
       }
    }
 
-   private boolean blockingRunIO() {
+   private boolean blockingRunIoEventLoop() {
       // try to go to sleep waiting for I/O tasks
       running.set(false);
       // StoreLoad barrier: see https://www.scylladb.com/2018/02/15/memory-barriers-seastar-linux/
@@ -98,30 +97,35 @@ public class VirtualThreadNettyScheduler implements Executor {
          if (!canBlock()) {
             return false;
          }
-         return ioEventLoop.run(MAX_WAIT_TASKS_NS, RUNNING_YIELD_US) == 0;
+         return ioEventLoop.run(MAX_WAIT_TASKS_NS, MAX_RUN_NS) == 0;
       } finally{
          running.set(true);
       }
    }
 
-   private void virtualThreadSchedulerLoop() {
-      // start the event loop thread
+   // 这个函数就是载体线程上运行的runnable
+   // 这里的函数内部跑在CarrierThread上面
+   private void driverVirtualThreadAndIOEventLoop() {
       var eventLoop = this.ioEventLoop;
+      // 启动跑IoHandle的VT线程 这里就是做到了用虚拟线程跑eventLoop
+      // 也就是execute函数第一次被调用的地方 eventLoopContinuation 就是这样来的
+      // eventLoopThread.start(); -> this.executor
       eventLoopThread.start();
-      // we expect here the continuation to be set up already
+      // eventLoopContinuation会在execute方法里面赋值
+      // 即 eventLoopThread.start(); 后就会赋值
       var eventLoopContinuation = this.eventLoopContinuation;
       assert eventLoopContinuation != null && eventLoopContinuationAvailable.getCount() == 0;
       // we keep on running until the event loop is shutting-down
       while (!eventLoop.isTerminated()) {
-         // if the event loop was idle, we apply a different limit to the yield time
-         final boolean eventLoopRunning = running.get();
-         final long yieldDurationNs = eventLoopRunning ? RUNNING_YIELD_US : IDLE_YIELD_US;
-         int count = runExternalContinuations(yieldDurationNs);
+         // 跑vt任务
+         int count = runExternalContinuations(MAX_RUN_NS);
+         // eventLoopThread.start()会投递一次
+         // runIOHandler中的Thread.yield也会投递一次
          if (submittedEventLoopContinuation) {
+            // 跑IO任务 以及随之而来的ChannelPipeline回调
             submittedEventLoopContinuation = false;
             eventLoopContinuation.run();
          } else if (count == 0) {
-            // nothing to run, including the event loop: we can park
             parkedCarrierThread = carrierThread;
             if (canBlock()) {
                LockSupport.park();
@@ -131,7 +135,7 @@ public class VirtualThreadNettyScheduler implements Executor {
       }
       while (!canBlock()) {
          // we still have continuations to run, let's run them
-         runExternalContinuations(RUNNING_YIELD_US);
+         runExternalContinuations(MAX_RUN_NS);
          if (submittedEventLoopContinuation) {
             submittedEventLoopContinuation = false;
             eventLoopContinuation.run();
@@ -168,25 +172,30 @@ public class VirtualThreadNettyScheduler implements Executor {
       if (ioEventLoop.isTerminated()) {
          throw new RejectedExecutionException("event loop is shutting down");
       }
-      // The default scheduler won't shut down, but Netty's event loop can!
+
       Runnable eventLoopContinuation = this.eventLoopContinuation;
       if (eventLoopContinuation == null) {
          eventLoopContinuation = setEventLoopContinuation(command);
       }
+      // 跑IoHandle的不要放进externalContinuations里面
+      // 由driverVirtualThreadAndIOEventLoop拿到eventLoopContinuation进行run
       if (eventLoopContinuation == command) {
          submittedEventLoopContinuation = true;
       } else {
+         // 当作vt调度器来的各种vt内部的continuation
          externalContinuations.offer(command);
       }
-      if (!ioEventLoop.inEventLoop(Thread.currentThread())) {
-         // TODO: if we have access to the scheduler brought by the continuation,
-         //       we could skip the wakeup if matches with this.
+      Thread currentThread = Thread.currentThread();
+      // 如果当前是虚拟线程且跑在当前调度器上 那么不需要唤醒
+      // 如果当前就是调度器线程 那么也不需要唤醒
+      if (!isCurrentVTRunOnScheduler(currentThread) && !ioEventLoop.inEventLoop(currentThread)) {
          ioEventLoop.wakeup();
          LockSupport.unpark(parkedCarrierThread);
-      } else if (eventLoopContinuation != command && !running.get()) {
-         // since the event loop was blocked, it's fine if we try to consume some continuations, if any
-         Thread.yield();
       }
+   }
+
+   private boolean isCurrentVTRunOnScheduler(Thread thread) {
+      return thread.isVirtual() && LoomSupport.getScheduler(thread) == this;
    }
 
    private Runnable setEventLoopContinuation(Runnable command) {
@@ -195,6 +204,10 @@ public class VirtualThreadNettyScheduler implements Executor {
       // we need to notify the event loop that we have a continuation
       eventLoopContinuationAvailable.countDown();
       return command;
+   }
+
+   Executor toVTExecutor() {
+      return Executors.newThreadPerTaskExecutor(vThreadFactory);
    }
 
 }

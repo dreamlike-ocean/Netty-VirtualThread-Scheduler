@@ -36,7 +36,7 @@ import java.util.concurrent.ThreadFactory;
 
 public class EchoServer {
 
-	public static void main(String[] args) throws Exception {
+	public static void startServer(String[] args) throws Exception {
 		// simple echo server on port 8080
 		try (var group = new VirtualMultithreadIoEventLoopGroup(1, NioIoHandler.newFactory())) {
 			var bootstrap = new ServerBootstrap().group(group).channel(NioServerSocketChannel.class)

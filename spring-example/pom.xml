@@ -9,8 +9,12 @@
         <version>1.0-SNAPSHOT</version>
     </parent>
 
-    <artifactId>example-echo</artifactId>
+    <artifactId>spring-example</artifactId>
     <packaging>jar</packaging>
+
+    <properties>
+        <spring-boot.version>4.0.5</spring-boot.version>
+    </properties>
 
     <dependencies>
         <dependency>
@@ -19,13 +23,38 @@
             <version>${project.version}</version>
         </dependency>
         <dependency>
-            <groupId>io.netty</groupId>
-            <artifactId>netty-all</artifactId>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+            <version>${spring-boot.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-tomcat</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <!-- Minimal servlet container on Netty (dsyer/dispatcher-servlet-container) -->
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>dispatcher</artifactId>
+            <version>1.0.0-SNAPSHOT</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>io.projectreactor.netty</groupId>
+                    <artifactId>reactor-netty-http</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter</artifactId>
-            <version>4.0.3</version>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-codec-http</artifactId>
+            <version>${netty.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-transport-native-epoll</artifactId>
+            <version>${netty.version}</version>
+            <classifier>linux-x86_64</classifier>
         </dependency>
     </dependencies>
 
@@ -47,23 +76,9 @@
                     </archive>
                 </configuration>
             </plugin>
-            <plugin>
-                <groupId>org.codehaus.mojo</groupId>
-                <artifactId>exec-maven-plugin</artifactId>
-                <version>3.6.3</version>
-                <configuration>
-                    <mainClass>io.netty.loom.example.EchoServer</mainClass>
-                    <arguments/>
-                    <systemProperties>
-                        <systemProperty>
-                            <key>jdk.virtualThreadScheduler.implClass</key>
-                            <value>io.netty.loom.spi.NettyScheduler</value>
-                        </systemProperty>
-                    </systemProperties>
-                    <cleanupDaemonThreads>false</cleanupDaemonThreads>
-                </configuration>
-            </plugin>
 
+            <!-- Unpack bootstrap + jctools into MRJAR so the system classloader
+                 can find them in a Spring Boot fat JAR. -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-dependency-plugin</artifactId>
@@ -82,7 +97,15 @@
                                     <artifactId>netty-virtualthread-bootstrap</artifactId>
                                     <version>${project.version}</version>
                                     <type>jar</type>
-                                    <includes>io/netty/loom/spi/**</includes>
+                                    <includes>io/netty/loom/scheduler/**</includes>
+                                    <outputDirectory>${project.build.outputDirectory}/META-INF/versions/${java.version}</outputDirectory>
+                                </artifactItem>
+                                <artifactItem>
+                                    <groupId>org.jctools</groupId>
+                                    <artifactId>jctools-core</artifactId>
+                                    <version>4.0.6</version>
+                                    <type>jar</type>
+                                    <includes>org/jctools/**</includes>
                                     <outputDirectory>${project.build.outputDirectory}/META-INF/versions/${java.version}</outputDirectory>
                                 </artifactItem>
                             </artifactItems>
@@ -95,13 +118,17 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
-                <version>4.0.3</version>
+                <version>${spring-boot.version}</version>
                 <configuration>
                     <mainClass>io.netty.loom.example.Main</mainClass>
                     <excludes>
                         <exclude>
                             <groupId>io.netty.loom</groupId>
                             <artifactId>netty-virtualthread-bootstrap</artifactId>
+                        </exclude>
+                        <exclude>
+                            <groupId>org.jctools</groupId>
+                            <artifactId>jctools-core</artifactId>
                         </exclude>
                     </excludes>
                 </configuration>
@@ -113,7 +140,6 @@
                     </execution>
                 </executions>
             </plugin>
-
         </plugins>
     </build>
 </project>

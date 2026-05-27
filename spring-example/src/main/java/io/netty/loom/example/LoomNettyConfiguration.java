@@ -14,20 +14,18 @@
  */
 package io.netty.loom.example;
 
-import org.springframework.boot.CommandLineRunner;
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.web.server.autoconfigure.ServerProperties;
+import org.springframework.boot.web.server.servlet.ConfigurableServletWebServerFactory;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 
-@SpringBootApplication
-public class Main implements CommandLineRunner {
+@Configuration(proxyBeanMethods = false)
+@EnableConfigurationProperties(ServerProperties.class)
+public class LoomNettyConfiguration {
 
-	public static void main(String[] args) {
-		System.setProperty("jdk.virtualThreadScheduler.implClass", "io.netty.loom.spi.NettyScheduler");
-		SpringApplication.run(Main.class, args);
-	}
-
-	@Override
-	public void run(String... args) throws Exception {
-		EchoServer.startServer(args);
+	@Bean
+	public ConfigurableServletWebServerFactory webServerFactory(ServerProperties server) {
+		return new LoomNettyWebServerFactory(server);
 	}
 }

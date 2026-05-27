@@ -14,6 +14,8 @@
  */
 package io.netty.loom.scheduler;
 
+import java.util.Objects;
+
 /**
  * Custom virtual thread scheduler loaded by the JDK via
  * {@code -Djdk.virtualThreadScheduler.implClass=io.netty.loom.scheduler.NettyScheduler}.
@@ -41,6 +43,9 @@ public class NettyScheduler implements Thread.VirtualThreadScheduler {
 	private final boolean perCarrierPollers;
 
 	public NettyScheduler(Thread.VirtualThreadScheduler jdkBuiltinScheduler) {
+		Objects.requireNonNull(jdkBuiltinScheduler,
+				"jdkBuiltinScheduler must not be null — " + "this constructor should only be called by the JDK via "
+						+ "-Djdk.virtualThreadScheduler.implClass=io.netty.loom.scheduler.NettyScheduler");
 		this.jdkBuiltinScheduler = jdkBuiltinScheduler;
 		this.perCarrierPollers = Integer.getInteger("jdk.pollerMode", -1) == 3;
 		this.group = new EventLoopSchedulerGroup(this);

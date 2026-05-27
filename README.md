@@ -572,16 +572,34 @@ Each event records:
 
 | Module | Description |
 |---|---|
-| `netty-virtualthread-bootstrap` | JDK-only shim (`NettyScheduler` + `NettySchedulerSpi`). Must be on the system classloader. |
-| `netty-virtualthread-core` | Scheduler + Netty integration. Discovered via ServiceLoader (TCCL). |
+| `netty-virtualthread-bootstrap` | Scheduling core (`io.netty.loom.scheduler`): `NettyScheduler`, `EventLoopScheduler`, `EventLoopSchedulerGroup`, JFR events. Must be on the system classloader. |
+| `netty-virtualthread-core` | Netty integration layer (`io.netty.loom`): `VirtualIoNativePollerEventLoopGroup`, `VirtualIoNioPollerEventLoopGroup`, `VirtualIoEventLoopGroup`. |
+| `spring-example` | Spring Boot MVC on Netty with epoll pinned pollers. Demonstrates fat JAR classloader handling. |
 
-## Fat JAR / application server deployment
+All scheduling state (carrier pool singleton, `ScopedValue`, `instanceof` checks) lives in bootstrap, loaded once by the system classloader. No per-classloader duplication in app servers.
 
-The JVM loads the scheduler via the system classloader. Frameworks like Spring Boot use isolated classloaders. The bootstrap module must be visible to the system classloader; the core module is discovered via ServiceLoader through the TCCL.
+### Why jctools is a separate dependency
 
-### Spring Boot
+The bootstrap module uses `MpscUnboundedArrayQueue` from jctools for the carrier run queue. Ideally jctools would be shaded (relocated) into the bootstrap JAR to make it self-contained. However, the `maven-shade-plugin` uses ASM for bytecode rewriting, and ASM does not yet support Java 27 class files (major version 71). Until ASM catches up, jctools must be deployed alongside bootstrap as a separate JAR. This affects fat JAR deployments (see below).
 
-Use Multi-Release JAR entries to expose bootstrap classes to the system classloader:
+## Deployment
+
+The JVM flag `-Djdk.virtualThreadScheduler.implClass=io.netty.loom.scheduler.NettyScheduler` tells the JDK to load our scheduler. The JDK uses the **system classloader** for this, which creates a constraint: our scheduler classes must be visible to the system classloader regardless of how the application packages its dependencies.
+
+### Flat classpath (plain `java -cp`)
+
+Add bootstrap, jctools, and core JARs to the classpath. Everything works:
+
+```sh
+java --enable-preview \
+  -Djdk.virtualThreadScheduler.implClass=io.netty.loom.scheduler.NettyScheduler \
+  -cp "bootstrap.jar:jctools-core.jar:core.jar:netty-all.jar:app.jar" \
+  com.example.Main
+```
+
+### Spring Boot fat JAR
+
+Spring Boot's `LaunchedClassLoader` loads app classes from `BOOT-INF/classes/`. The system classloader cannot see them. The solution: unpack bootstrap and jctools classes into the Multi-Release JAR layer (`META-INF/versions/27/`), and exclude them from `BOOT-INF/lib/` so they're not loaded twice.
 
 ```xml
 <!-- Mark as Multi-Release -->
@@ -597,7 +615,7 @@ Use Multi-Release JAR entries to expose bootstrap classes to the system classloa
     </configuration>
 </plugin>
 
-<!-- Unpack bootstrap into META-INF/versions/27/ -->
+<!-- Unpack bootstrap + jctools into META-INF/versions/27/ -->
 <plugin>
     <groupId>org.apache.maven.plugins</groupId>
     <artifactId>maven-dependency-plugin</artifactId>
@@ -613,8 +631,16 @@ Use Multi-Release JAR entries to expose bootstrap classes to the system classloa
                         <artifactId>netty-virtualthread-bootstrap</artifactId>
                         <version>${netty-loom.version}</version>
                         <type>jar</type>
-                        <includes>io/netty/loom/spi/**</includes>
-                        <outputDirectory>${project.build.outputDirectory}/META-INF/versions/27</outputDirectory>
+                        <includes>io/netty/loom/scheduler/**</includes>
+                        <outputDirectory>${project.build.outputDirectory}/META-INF/versions/${java.version}</outputDirectory>
+                    </artifactItem>
+                    <artifactItem>
+                        <groupId>org.jctools</groupId>
+                        <artifactId>jctools-core</artifactId>
+                        <version>4.0.6</version>
+                        <type>jar</type>
+                        <includes>org/jctools/**</includes>
+                        <outputDirectory>${project.build.outputDirectory}/META-INF/versions/${java.version}</outputDirectory>
                     </artifactItem>
                 </artifactItems>
             </configuration>
@@ -622,7 +648,7 @@ Use Multi-Release JAR entries to expose bootstrap classes to the system classloa
     </executions>
 </plugin>
 
-<!-- Exclude bootstrap from BOOT-INF/lib/ -->
+<!-- Exclude bootstrap + jctools from BOOT-INF/lib/ -->
 <plugin>
     <groupId>org.springframework.boot</groupId>
     <artifactId>spring-boot-maven-plugin</artifactId>
@@ -632,14 +658,36 @@ Use Multi-Release JAR entries to expose bootstrap classes to the system classloa
                 <groupId>io.netty.loom</groupId>
                 <artifactId>netty-virtualthread-bootstrap</artifactId>
             </exclude>
+            <exclude>
+                <groupId>org.jctools</groupId>
+                <artifactId>jctools-core</artifactId>
+            </exclude>
         </excludes>
     </configuration>
 </plugin>
 ```
 
-### Application servers (OpenLiberty, WildFly)
+See the `spring-example` module for a complete working example.
 
-Place the bootstrap JAR on the system classpath or `-Xbootclasspath/a:`. The core JAR stays inside the application deployment (WAR/EAR).
+### Quarkus
+
+**Legacy-jar** (`quarkus.package.jar.type=legacy-jar`): flat classpath on the system classloader — bootstrap is visible, works without any workaround.
+
+**Fast-jar** (default): Quarkus uses `RunnerClassLoader`, not the system classloader. The same constraint as Spring Boot applies: the JDK's `VirtualThread.loadCustomScheduler()` uses `ClassLoader.getSystemClassLoader()` and won't find classes inside the fast-jar structure. Place the bootstrap and jctools JARs on the system classpath separately (`-cp` or `-Xbootclasspath/a:`).
+
+### Application servers (WildFly, OpenLiberty)
+
+Place the bootstrap JAR and jctools JAR on the system classpath or `-Xbootclasspath/a:`. The core JAR stays inside the application deployment (WAR/EAR). Because all scheduling state lives in bootstrap (system classloader), multiple deployments sharing the same JVM share a single carrier pool — no `instanceof` failures, no duplicate carriers.
+
+### Summary
+
+| Deployment | System CL sees bootstrap? | Action needed |
+|---|---|---|
+| Flat classpath (`java -cp`) | Yes | None |
+| Spring Boot fat JAR | No | MRJAR unpack (see above) |
+| Quarkus legacy-jar | Yes | None |
+| Quarkus fast-jar | No | Separate system classpath |
+| App server (WAR/EAR) | No | Bootstrap on system classpath |
 
 ## Dev container
 
@@ -658,4 +706,5 @@ mvn clean install
 
 Apache License 2.0 — see [LICENSE](LICENSE).
 
-Credit: [dreamlike-ocean](https://github.com/dreamlike-ocean) for identifying and fixing the fat-JAR classloader issue.
+Credit: [dreamlike-ocean](https://github.com/dreamlike-ocean) for identifying the fat-JAR classloader issue.
+Spring Boot Netty integration uses [dsyer/dispatcher-servlet-container](https://github.com/dsyer/dispatcher-servlet-container).

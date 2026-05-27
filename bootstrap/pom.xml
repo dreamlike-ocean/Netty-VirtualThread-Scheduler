@@ -12,7 +12,43 @@
 
     <artifactId>netty-virtualthread-bootstrap</artifactId>
 
-    <!-- No dependencies: this module must stay JDK-only so it can sit on the
-         system classpath without pulling in Netty or any other library. -->
+    <dependencies>
+        <dependency>
+            <groupId>org.jctools</groupId>
+            <artifactId>jctools-core</artifactId>
+            <version>4.0.6</version>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-params</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- TODO: shade jctools when ASM supports Java 27 class files (major version 71).
+                 Until then, jctools-core must be on the system classpath alongside this JAR. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>perCarrierPollers-test</id>
+                        <phase>none</phase>
+                    </execution>
+                    <execution>
+                        <id>workStealing-test</id>
+                        <phase>none</phase>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 
 </project>

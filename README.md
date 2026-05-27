@@ -122,7 +122,7 @@ A carrier can optionally host a **pinned poller** — a long-running virtual thr
 ## Prerequisites
 
 - A Loom-enabled JDK (Java 27+, [builds.shipilev.net](https://builds.shipilev.net/openjdk-jdk-loom/) or build from [openjdk/loom](https://github.com/openjdk/loom))
-- JVM flag: `-Djdk.virtualThreadScheduler.implClass=io.netty.loom.spi.NettyScheduler`
+- JVM flag: `-Djdk.virtualThreadScheduler.implClass=io.netty.loom.scheduler.NettyScheduler`
 - Maven 3.6+
 
 ## Usage
